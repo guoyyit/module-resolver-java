@@ -1,0 +1,4 @@
+# 核心模块：导出共享包并提供 SPI 实现
+module com.example.core
+exports com.example.api
+provides com.example.api.Greeter with com.example.core.DefaultGreeter

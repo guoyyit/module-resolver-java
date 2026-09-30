@@ -37,3 +37,6 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### Module resolver test state ###
+target/test-state/
+var/

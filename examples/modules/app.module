@@ -1,0 +1,6 @@
+# 应用模块：依赖核心模块，消费服务，并可选依赖日志模块
+module com.example.app
+requires com.example.core
+requires static com.example.logging
+consumes com.example.api.Greeter
+consumes optional com.example.logging.Logger
