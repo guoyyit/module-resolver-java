@@ -37,3 +37,7 @@ build/
 
 ### Mac OS ###
 .DS_Store
+
+### Resolver runtime state ###
+resolver-state/
+**/resolver-state/
