@@ -1,11 +1,14 @@
 package com.github.guoyyit.moduleresolverjava.analysis;
 
+import com.github.guoyyit.moduleresolverjava.graph.DependencyGraph;
 import com.github.guoyyit.moduleresolverjava.model.Diagnostic;
 import com.github.guoyyit.moduleresolverjava.model.ExportedPackage;
 import com.github.guoyyit.moduleresolverjava.model.ModuleDeclaration;
 import com.github.guoyyit.moduleresolverjava.model.PackageOwnership;
 import com.github.guoyyit.moduleresolverjava.model.Position;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -29,13 +32,46 @@ import java.util.TreeSet;
  *       the lexicographically smallest contender is recorded as the tentative
  *       owner so downstream processing stays deterministic.</li>
  * </ol>
+ *
+ * <p>{@link #resolveIncremental} recomputes only packages whose contender set
+ * changed or that have a contender inside the engine's recompute set (their
+ * mutual reachability may have changed); every other package keeps the
+ * previous {@link PackageOwnership} object, so unaffected conclusions are
+ * shared with the previous snapshot.
  */
 public final class PackageConflictResolver {
 
+    /**
+     * Outcome of an incremental ownership pass: the full ownership table plus
+     * the set of packages whose ownership actually changed relative to the
+     * previous version.
+     */
+    public record OwnershipOutcome(Map<String, PackageOwnership> owners,
+                                   Set<String> changedPackages) {
+    }
+
     public Map<String, PackageOwnership> resolve(Map<String, ModuleDeclaration> declarations) {
+        DependencyGraph graph = DependencyGraph.from(edgesOf(declarations));
+        return resolveIncremental(declarations, graph, Map.of(),
+                declarations.keySet()).owners();
+    }
+
+    /**
+     * Incremental ownership resolution.
+     *
+     * @param previousOwners ownership table of the previous committed version
+     *                       (empty for a full resolve)
+     * @param recompute      modules whose dependency edges may have changed;
+     *                       packages with no contender in this set and an
+     *                       unchanged contender list keep the previous object
+     */
+    public OwnershipOutcome resolveIncremental(
+            Map<String, ModuleDeclaration> declarations,
+            DependencyGraph graph,
+            Map<String, PackageOwnership> previousOwners,
+            Set<String> recompute) {
         Map<String, List<String>> exporters = new TreeMap<>();
         Map<String, Position> exportPositions = new HashMap<>();
-
         for (ModuleDeclaration declaration : new TreeMap<>(declarations).values()) {
             for (ExportedPackage exported : declaration.exports()) {
                 exporters.computeIfAbsent(exported.packageName(),
@@ -45,14 +81,75 @@ public final class PackageConflictResolver {
             }
         }
 
-        Map<String, Set<String>> reachable = computeReachability(declarations);
+        Set<String> allPackages = new TreeSet<>(exporters.keySet());
+        allPackages.addAll(previousOwners.keySet());
+
         Map<String, PackageOwnership> result = new TreeMap<>();
-        for (Map.Entry<String, List<String>> entry : exporters.entrySet()) {
-            String packageName = entry.getKey();
-            List<String> contenders = new ArrayList<>(new TreeSet<>(entry.getValue()));
-            result.put(packageName, resolveOne(packageName, contenders, reachable, exportPositions));
+        Set<String> changed = new TreeSet<>();
+        for (String packageName : allPackages) {
+            List<String> contenders = exporters.containsKey(packageName)
+                    ? List.copyOf(new TreeSet<>(exporters.get(packageName)))
+                    : List.of();
+            PackageOwnership previous = previousOwners.get(packageName);
+            if (contenders.isEmpty()) {
+                if (previous != null) {
+                    changed.add(packageName);
+                }
+                continue;
+            }
+            boolean contendersUnchanged =
+                    previous != null && previous.contenders().equals(contenders);
+            boolean anyContenderRecomputed = contenders.stream().anyMatch(recompute::contains);
+            if (contendersUnchanged && !anyContenderRecomputed) {
+                result.put(packageName, previous);
+                continue;
+            }
+            PackageOwnership fresh = resolveOne(packageName, contenders,
+                    reachabilityAmong(contenders, graph), exportPositions);
+            if (fresh.equals(previous)) {
+                result.put(packageName, previous);
+            } else {
+                result.put(packageName, fresh);
+                changed.add(packageName);
+            }
         }
-        return Map.copyOf(result);
+        return new OwnershipOutcome(
+                Collections.unmodifiableMap(result), Collections.unmodifiableSet(changed));
+    }
+
+    private static Map<String, List<String>> edgesOf(
+            Map<String, ModuleDeclaration> declarations) {
+        Map<String, List<String>> edges = new TreeMap<>();
+        for (ModuleDeclaration declaration : declarations.values()) {
+            edges.put(declaration.name(),
+                    declaration.requires().stream().map(req -> req.name()).toList());
+        }
+        return edges;
+    }
+
+    /**
+     * Reachability restricted to the modules that matter for one package:
+     * each contender mapped to the set of modules reachable from it. Single
+     * contender packages need no graph walk at all.
+     */
+    private static Map<String, Set<String>> reachabilityAmong(List<String> contenders,
+                                                              DependencyGraph graph) {
+        Map<String, Set<String>> reachable = new HashMap<>();
+        if (contenders.size() <= 1) {
+            return reachable;
+        }
+        for (String contender : contenders) {
+            Set<String> visited = new TreeSet<>();
+            ArrayDeque<String> queue = new ArrayDeque<>(graph.directDependencies(contender));
+            while (!queue.isEmpty()) {
+                String current = queue.poll();
+                if (visited.add(current)) {
+                    queue.addAll(graph.directDependencies(current));
+                }
+            }
+            reachable.put(contender, Set.copyOf(visited));
+        }
+        return reachable;
     }
 
     private static PackageOwnership resolveOne(String packageName,
@@ -103,31 +200,5 @@ public final class PackageConflictResolver {
                 position);
         return new PackageOwnership(packageName, tentativeOwner, List.copyOf(contenders),
                 true, "AMBIGUOUS_EXPORT", List.of(error));
-    }
-
-    private static Map<String, Set<String>> computeReachability(
-            Map<String, ModuleDeclaration> declarations) {
-        Map<String, Set<String>> direct = new TreeMap<>();
-        for (ModuleDeclaration declaration : declarations.values()) {
-            direct.put(declaration.name(), new TreeSet<>(
-                    declaration.requires().stream().map(req -> req.name()).toList()));
-        }
-        Map<String, Set<String>> reachable = new TreeMap<>();
-        for (String module : new TreeSet<>(direct.keySet())) {
-            reachable.put(module, reach(module, direct));
-        }
-        return reachable;
-    }
-
-    private static Set<String> reach(String start, Map<String, Set<String>> direct) {
-        Set<String> visited = new TreeSet<>();
-        List<String> queue = new ArrayList<>(direct.getOrDefault(start, Set.of()));
-        while (!queue.isEmpty()) {
-            String current = queue.remove(0);
-            if (visited.add(current)) {
-                queue.addAll(direct.getOrDefault(current, Set.of()));
-            }
-        }
-        return Set.copyOf(visited);
     }
 }

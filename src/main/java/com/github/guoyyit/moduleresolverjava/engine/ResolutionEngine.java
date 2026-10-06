@@ -4,7 +4,9 @@ import com.github.guoyyit.moduleresolverjava.analysis.PackageConflictResolver;
 import com.github.guoyyit.moduleresolverjava.analysis.ServiceBinder;
 import com.github.guoyyit.moduleresolverjava.graph.CycleDetector;
 import com.github.guoyyit.moduleresolverjava.graph.DependencyGraph;
+import com.github.guoyyit.moduleresolverjava.graph.Readability;
 import com.github.guoyyit.moduleresolverjava.model.Diagnostic;
+import com.github.guoyyit.moduleresolverjava.model.ExportedPackage;
 import com.github.guoyyit.moduleresolverjava.model.FileParseOutcome;
 import com.github.guoyyit.moduleresolverjava.model.ModuleDeclaration;
 import com.github.guoyyit.moduleresolverjava.model.ModuleDependency;
@@ -13,9 +15,12 @@ import com.github.guoyyit.moduleresolverjava.model.PackageOwnership;
 import com.github.guoyyit.moduleresolverjava.model.Position;
 import com.github.guoyyit.moduleresolverjava.model.ResolutionSnapshot;
 import com.github.guoyyit.moduleresolverjava.model.ServiceBinding;
+import com.github.guoyyit.moduleresolverjava.model.ServiceConsumption;
 
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -83,13 +88,35 @@ public final class ResolutionEngine {
             return new ResolutionResult(null, Set.of(), Map.of(), true);
         }
 
-        Map<String, PackageOwnership> packageOwners =
-                packageConflictResolver.resolve(declarations);
+        // Modules whose conclusions may change: the modules of the changed
+        // files (old and new names) plus every module that can reach them
+        // through requires edges. Everything outside this set is provably
+        // unchanged and keeps the previous conclusion objects.
+        Set<String> recompute = previous == null
+                ? declarations.keySet()
+                : computeRecomputeSet(previous, changedFiles, files, graph);
+
+        Readability.Tables readability = previous == null
+                ? Readability.computeAll(declarations)
+                : Readability.computeIncremental(declarations, recompute,
+                        previousReadable(previous), previousPropagated(previous));
+        Map<String, List<String>> readable = readability.readable();
+        Map<String, List<String>> propagated = readability.propagated();
         if (Thread.currentThread().isInterrupted()) {
             return new ResolutionResult(null, Set.of(), Map.of(), true);
         }
-        Map<String, List<ServiceBinding>> serviceBindings =
-                serviceBinder.bind(declarations, graph, packageOwners);
+
+        PackageConflictResolver.OwnershipOutcome ownership =
+                packageConflictResolver.resolveIncremental(declarations, graph,
+                        previous == null ? Map.of() : previous.packageOwners(), recompute);
+        Map<String, PackageOwnership> packageOwners = ownership.owners();
+        if (Thread.currentThread().isInterrupted()) {
+            return new ResolutionResult(null, Set.of(), Map.of(), true);
+        }
+        Map<String, List<ServiceBinding>> serviceBindings = serviceBinder.bindIncremental(
+                declarations, graph, packageOwners, readable,
+                previous == null ? Map.of() : previous.serviceBindings(),
+                recompute, ownership.changedPackages());
         if (Thread.currentThread().isInterrupted()) {
             return new ResolutionResult(null, Set.of(), Map.of(), true);
         }
@@ -97,23 +124,39 @@ public final class ResolutionEngine {
         List<List<String>> cycles = cycleDetector.findCycles(graph);
         Map<String, Set<List<String>>> cyclesByModule = cycleDetector.cyclesByModule(graph);
 
-        Map<String, ModuleResolution> modules = buildModuleResolutions(
-                declarations, graph, cyclesByModule, packageOwners, serviceBindings);
+        ModulesOutcome modules = buildModuleResolutions(
+                declarations, graph, cyclesByModule, packageOwners, serviceBindings,
+                readable, propagated, previous, recompute, ownership.changedPackages());
 
         addPackageDiagnostics(packageOwners, globalDiagnostics);
         addServiceDiagnostics(serviceBindings, globalDiagnostics);
         addCycleDiagnostics(cycles, globalDiagnostics);
 
-        Set<String> affected = previous == null
-                ? Set.copyOf(declarations.keySet())
-                : computeAffected(previous, changedFiles, files, declarations,
-                        packageOwners, serviceBindings);
+        Set<String> affected;
+        if (previous == null) {
+            affected = Set.copyOf(declarations.keySet());
+        } else {
+            // A consumer whose binding list object changed is affected even
+            // when its module-level conclusion stayed identical.
+            Set<String> changed = new TreeSet<>(modules.affected());
+            for (Map.Entry<String, List<ServiceBinding>> entry : serviceBindings.entrySet()) {
+                if (entry.getValue() != previous.serviceBindings().get(entry.getKey())) {
+                    changed.add(entry.getKey());
+                }
+            }
+            for (String consumer : previous.serviceBindings().keySet()) {
+                if (!serviceBindings.containsKey(consumer)) {
+                    changed.add(consumer);
+                }
+            }
+            affected = Set.copyOf(changed);
+        }
 
         ResolutionSnapshot snapshot = new ResolutionSnapshot(
                 baseVersion + 1, Instant.now(),
                 Map.copyOf(files),
                 Map.copyOf(declarations),
-                Map.copyOf(modules),
+                Map.copyOf(modules.resolutions()),
                 List.copyOf(globalDiagnostics),
                 Map.copyOf(packageOwners),
                 deepCopyBindings(serviceBindings));
@@ -199,39 +242,115 @@ public final class ResolutionEngine {
         return DependencyGraph.from(edges);
     }
 
-    private static Map<String, ModuleResolution> buildModuleResolutions(
+    /**
+     * Result of the per-module conclusion pass: the conclusions of all
+     * modules plus the set of modules whose conclusion actually changed.
+     */
+    private record ModulesOutcome(Map<String, ModuleResolution> resolutions,
+                                  Set<String> affected) {
+    }
+
+    /**
+     * Builds module conclusions, reusing the previous version's
+     * {@link ModuleResolution} object for every module whose inputs cannot
+     * have changed (outside the recompute set and untouched by ownership
+     * changes) or whose freshly computed conclusion is content-equal. The
+     * returned affected set contains exactly the modules that did not keep
+     * the previous object.
+     */
+    private static ModulesOutcome buildModuleResolutions(
             Map<String, ModuleDeclaration> declarations,
             DependencyGraph graph,
             Map<String, Set<List<String>>> cyclesByModule,
             Map<String, PackageOwnership> packageOwners,
-            Map<String, List<ServiceBinding>> serviceBindings) {
-        Map<String, ModuleResolution> result = new TreeMap<>();
-        for (ModuleDeclaration declaration : declarations.values()) {
-            String name = declaration.name();
-            Set<List<String>> cycles = cyclesByModule.getOrDefault(name, Set.of());
-            List<List<String>> sortedCycles = new ArrayList<>(cycles);
-            sortedCycles.sort((a, b) -> a.toString().compareTo(b.toString()));
-
-            List<Diagnostic> diagnostics = new ArrayList<>();
-            for (PackageOwnership ownership : packageOwners.values()) {
-                if (name.equals(shadowingModule(ownership))) {
-                    diagnostics.addAll(ownership.diagnostics());
+            Map<String, List<ServiceBinding>> serviceBindings,
+            Map<String, List<String>> readable,
+            Map<String, List<String>> propagated,
+            ResolutionSnapshot previous,
+            Set<String> recompute,
+            Set<String> changedOwnershipPackages) {
+        Set<String> exportsChanged = new HashSet<>();
+        Set<String> consumesChanged = new HashSet<>();
+        if (!changedOwnershipPackages.isEmpty()) {
+            for (ModuleDeclaration declaration : declarations.values()) {
+                for (ExportedPackage exported : declaration.exports()) {
+                    if (changedOwnershipPackages.contains(exported.packageName())) {
+                        exportsChanged.add(declaration.name());
+                    }
+                }
+                for (ServiceConsumption consumption : declaration.consumes()) {
+                    String pkg = packageOf(consumption.serviceInterface());
+                    if (pkg != null && changedOwnershipPackages.contains(pkg)) {
+                        consumesChanged.add(declaration.name());
+                    }
                 }
             }
-            for (ServiceBinding binding : serviceBindings.getOrDefault(name, List.of())) {
-                diagnostics.addAll(binding.diagnostics());
-            }
-
-            result.put(name, new ModuleResolution(
-                    name,
-                    declaration.file(),
-                    List.copyOf(graph.directDependencies(name)),
-                    List.copyOf(graph.transitiveDependencies(name)),
-                    !cycles.isEmpty(),
-                    List.copyOf(sortedCycles),
-                    List.copyOf(diagnostics)));
         }
-        return result;
+
+        Map<String, ModuleResolution> result = new TreeMap<>();
+        Set<String> affected = new TreeSet<>();
+        for (ModuleDeclaration declaration : declarations.values()) {
+            String name = declaration.name();
+            ModuleResolution previousResolution =
+                    previous == null ? null : previous.modules().get(name);
+            boolean mustRecompute = previousResolution == null
+                    || recompute.contains(name)
+                    || exportsChanged.contains(name)
+                    || consumesChanged.contains(name);
+            if (!mustRecompute) {
+                result.put(name, previousResolution);
+                continue;
+            }
+            ModuleResolution fresh = buildOneModuleResolution(declaration, graph,
+                    cyclesByModule, packageOwners, serviceBindings, readable, propagated);
+            if (fresh.equals(previousResolution)) {
+                result.put(name, previousResolution);
+            } else {
+                result.put(name, fresh);
+                affected.add(name);
+            }
+        }
+        return new ModulesOutcome(result, affected);
+    }
+
+    private static ModuleResolution buildOneModuleResolution(
+            ModuleDeclaration declaration,
+            DependencyGraph graph,
+            Map<String, Set<List<String>>> cyclesByModule,
+            Map<String, PackageOwnership> packageOwners,
+            Map<String, List<ServiceBinding>> serviceBindings,
+            Map<String, List<String>> readable,
+            Map<String, List<String>> propagated) {
+        String name = declaration.name();
+        Set<List<String>> cycles = cyclesByModule.getOrDefault(name, Set.of());
+        List<List<String>> sortedCycles = new ArrayList<>(cycles);
+        sortedCycles.sort((a, b) -> a.toString().compareTo(b.toString()));
+
+        List<Diagnostic> diagnostics = new ArrayList<>();
+        for (PackageOwnership ownership : packageOwners.values()) {
+            if (name.equals(shadowingModule(ownership))) {
+                diagnostics.addAll(ownership.diagnostics());
+            }
+        }
+        for (ServiceBinding binding : serviceBindings.getOrDefault(name, List.of())) {
+            diagnostics.addAll(binding.diagnostics());
+        }
+
+        return new ModuleResolution(
+                name,
+                declaration.file(),
+                List.copyOf(graph.directDependencies(name)),
+                List.copyOf(graph.transitiveDependencies(name)),
+                readable.getOrDefault(name, List.of()),
+                propagated.getOrDefault(name, List.of()),
+                !cycles.isEmpty(),
+                List.copyOf(sortedCycles),
+                List.copyOf(diagnostics));
+    }
+
+    private static String packageOf(String className) {
+        int dot = className.lastIndexOf('.');
+        return dot < 0 ? null : className.substring(0, dot);
     }
 
     private static String shadowingModule(PackageOwnership ownership) {
@@ -273,67 +392,61 @@ public final class ResolutionEngine {
         }
     }
 
-    private static Set<String> computeAffected(
-            ResolutionSnapshot previous,
-            Set<String> changedFiles,
-            Map<String, FileParseOutcome> currentFiles,
-            Map<String, ModuleDeclaration> currentDeclarations,
-            Map<String, PackageOwnership> currentOwners,
-            Map<String, List<ServiceBinding>> currentBindings) {
-        Set<String> affected = new TreeSet<>();
+    /**
+     * Computes the set of modules that may observe a change: the modules
+     * declared by the changed files (both the previous and the current
+     * declaration, covering renames, deletions and parse failures) plus every
+     * module that can reach one of those seeds through requires edges in the
+     * current graph. Dependency edges only change when the declaring file
+     * changes, so a module outside this set has its whole forward dependency
+     * cone unchanged and none of its conclusions can differ.
+     */
+    private static Set<String> computeRecomputeSet(ResolutionSnapshot previous,
+                                                   Set<String> changedFiles,
+                                                   Map<String, FileParseOutcome> currentFiles,
+                                                   DependencyGraph graph) {
+        Set<String> seeds = new TreeSet<>();
         for (String file : changedFiles) {
-            addModuleOfFile(previous.files().get(file), affected);
-            addModuleOfFile(currentFiles.get(file), affected);
+            addModuleOfFile(previous.files().get(file), seeds);
+            addModuleOfFile(currentFiles.get(file), seeds);
         }
-        Set<String> initial = Set.copyOf(affected);
-        for (String module : currentDeclarations.keySet()) {
-            for (String seed : initial) {
-                if (dependsOn(currentDeclarations, module, seed)) {
-                    affected.add(module);
+        Map<String, List<String>> reverse = new HashMap<>();
+        for (String module : graph.modules()) {
+            for (String target : graph.directDependencies(module)) {
+                reverse.computeIfAbsent(target, key -> new ArrayList<>()).add(module);
+            }
+        }
+        Set<String> recompute = new TreeSet<>(seeds);
+        ArrayDeque<String> queue = new ArrayDeque<>(seeds);
+        while (!queue.isEmpty()) {
+            String current = queue.poll();
+            for (String parent : reverse.getOrDefault(current, List.of())) {
+                if (recompute.add(parent)) {
+                    queue.add(parent);
                 }
             }
         }
-        for (PackageOwnership ownership : currentOwners.values()) {
-            if (ownership.conflict()) {
-                affected.addAll(ownership.contenders());
-            }
-        }
-        for (Map.Entry<String, List<ServiceBinding>> entry : currentBindings.entrySet()) {
-            for (ServiceBinding binding : entry.getValue()) {
-                if (!"BOUND".equals(binding.status())
-                        || initial.contains(binding.selectedProvider())) {
-                    affected.add(entry.getKey());
-                }
-            }
-        }
-        return Set.copyOf(affected);
+        return recompute;
+    }
+
+    private static Map<String, List<String>> previousReadable(ResolutionSnapshot previous) {
+        Map<String, List<String>> map = new HashMap<>();
+        previous.modules().forEach((name, resolution) ->
+                map.put(name, resolution.readableModules()));
+        return map;
+    }
+
+    private static Map<String, List<String>> previousPropagated(ResolutionSnapshot previous) {
+        Map<String, List<String>> map = new HashMap<>();
+        previous.modules().forEach((name, resolution) ->
+                map.put(name, resolution.propagatedModules()));
+        return map;
     }
 
     private static void addModuleOfFile(FileParseOutcome outcome, Set<String> target) {
         if (outcome != null && outcome.success()) {
             target.add(outcome.declaration().name());
         }
-    }
-
-    private static boolean dependsOn(Map<String, ModuleDeclaration> declarations,
-                                     String module, String dependency) {
-        if (module.equals(dependency)) {
-            return true;
-        }
-        Set<String> seen = new HashSet<>();
-        List<String> queue = new ArrayList<>(declarations.get(module).requires().stream()
-                .map(ModuleDependency::name).toList());
-        while (!queue.isEmpty()) {
-            String current = queue.remove(0);
-            if (current.equals(dependency)) {
-                return true;
-            }
-            if (seen.add(current) && declarations.containsKey(current)) {
-                queue.addAll(declarations.get(current).requires().stream()
-                        .map(ModuleDependency::name).toList());
-            }
-        }
-        return false;
     }
 
     private static Map<String, List<ServiceBinding>> deepCopyBindings(

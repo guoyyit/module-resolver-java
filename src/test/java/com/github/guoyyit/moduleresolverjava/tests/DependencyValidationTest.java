@@ -45,6 +45,12 @@ class DependencyValidationTest {
         return DependencyGraph.from(edges);
     }
 
+    private static Map<String, List<String>> readableOf(
+            Map<String, ModuleDeclaration> declarations) {
+        return com.github.guoyyit.moduleresolverjava.graph.Readability
+                .computeAll(declarations).readable();
+    }
+
     @Test
     void detectsDirectAndTransitiveDependencies() {
         Map<String, ModuleDeclaration> declarations = parse(
@@ -138,7 +144,8 @@ class DependencyValidationTest {
         Map<String, PackageOwnership> ownerships =
                 new PackageConflictResolver().resolve(declarations);
         Map<String, List<ServiceBinding>> bindings =
-                new ServiceBinder().bind(declarations, graph, ownerships);
+                new ServiceBinder().bind(declarations, graph, ownerships,
+                        readableOf(declarations));
 
         ServiceBinding binding = bindings.get("com.app").get(0);
         assertEquals("api.Greeter", binding.serviceInterface());
@@ -159,7 +166,8 @@ class DependencyValidationTest {
                         """);
         DependencyGraph graph = graphOf(declarations);
         Map<String, List<ServiceBinding>> bindings = new ServiceBinder()
-                .bind(declarations, graph, new PackageConflictResolver().resolve(declarations));
+                .bind(declarations, graph, new PackageConflictResolver().resolve(declarations),
+                        readableOf(declarations));
 
         ServiceBinding required = bindings.get("com.app").stream()
                 .filter(b -> b.serviceInterface().equals("api.Required")).findFirst().orElseThrow();

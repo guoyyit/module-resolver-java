@@ -20,15 +20,19 @@ import java.util.TreeSet;
  * Validates {@code consumes} declarations against visible {@code provides}.
  *
  * <p>Visibility rule: a consumer M may use an interface provided by module P
- * when M == P or M depends on P (directly or transitively). Candidate
- * providers are further required to export the interface's package (the
- * package owner must export it to M through the chain; package ownership
- * itself is validated by {@link PackageConflictResolver}).
+ * when M == P or P is <em>readable</em> by M, i.e. P is a direct dependency
+ * of M or readability reaches P through {@code requires transitive} edges
+ * (see {@link com.github.guoyyit.moduleresolverjava.graph.Readability}).
+ * A provider reachable only through plain {@code requires} hops is
+ * <strong>not</strong> visible and never participates in binding. Candidate
+ * providers are further required to export the interface's package and the
+ * package ownership must be unambiguous (ownership itself is validated by
+ * {@link PackageConflictResolver}).
  *
  * <p>Selection rule for multiple visible providers:
  * <ol>
  *   <li>{@code DIRECT_PROVIDER}: providers required directly take precedence
- *       over transitively required ones.</li>
+ *       over providers visible only transitively.</li>
  *   <li>{@code LEXICOGRAPHIC}: the lexicographically smallest
  *       {@code (provider-module, implementation-class)} pair wins.</li>
  * </ol>
@@ -42,35 +46,98 @@ import java.util.TreeSet;
  */
 public final class ServiceBinder {
 
+    /**
+     * Full binding pass over every consumer (equivalent to an incremental
+     * pass where every module is recomputed).
+     */
     public Map<String, List<ServiceBinding>> bind(Map<String, ModuleDeclaration> declarations,
                                                   DependencyGraph graph,
-                                                  Map<String, PackageOwnership> packageOwners) {
+                                                  Map<String, PackageOwnership> packageOwners,
+                                                  Map<String, List<String>> readable) {
+        return bindIncremental(declarations, graph, packageOwners, readable,
+                Map.of(), declarations.keySet(), Set.of());
+    }
+
+    /**
+     * Incremental binding pass.
+     *
+     * <p>A consumer's bindings are recomputed only when the consumer is in
+     * {@code recomputeModules} (its dependencies, readability or own
+     * declarations may have changed) or when the ownership of a package it
+     * consumes an interface from changed. Every other consumer keeps the
+     * previous binding list <em>object</em>; recomputed consumers whose new
+     * bindings are content-equal to the previous ones also keep the previous
+     * object, so unchanged conclusions are shared across versions.
+     *
+     * <p>Soundness: a provider's provides/exports can only change when the
+     * provider itself changed, which puts every consumer that can read the
+     * provider into {@code recomputeModules}; ownership changes are covered
+     * by {@code changedOwnershipPackages}.
+     */
+    public Map<String, List<ServiceBinding>> bindIncremental(
+            Map<String, ModuleDeclaration> declarations,
+            DependencyGraph graph,
+            Map<String, PackageOwnership> packageOwners,
+            Map<String, List<String>> readable,
+            Map<String, List<ServiceBinding>> previousBindings,
+            Set<String> recomputeModules,
+            Set<String> changedOwnershipPackages) {
         Map<String, List<ServiceBinding>> result = new TreeMap<>();
 
         for (ModuleDeclaration consumerDecl : new TreeMap<>(declarations).values()) {
             String consumer = consumerDecl.name();
+            List<ServiceBinding> previous = previousBindings.get(consumer);
+            boolean mustRecompute = recomputeModules.contains(consumer)
+                    || consumesChangedPackage(consumerDecl, changedOwnershipPackages);
+            if (!mustRecompute) {
+                if (previous != null) {
+                    result.put(consumer, previous);
+                }
+                continue;
+            }
             List<ServiceBinding> bindings = new ArrayList<>();
             for (ServiceConsumption consumption : consumerDecl.consumes()) {
-                bindings.add(bindOne(consumer, consumption, declarations, graph, packageOwners));
+                bindings.add(bindOne(consumer, consumption, declarations, graph,
+                        packageOwners, readable));
             }
-            if (!bindings.isEmpty()) {
-                result.put(consumer, List.copyOf(bindings));
+            if (bindings.isEmpty()) {
+                continue;
+            }
+            List<ServiceBinding> fresh = List.copyOf(bindings);
+            if (fresh.equals(previous)) {
+                result.put(consumer, previous);
+            } else {
+                result.put(consumer, fresh);
             }
         }
-        return Map.copyOf(result);
+        return java.util.Collections.unmodifiableMap(result);
+    }
+
+    private static boolean consumesChangedPackage(ModuleDeclaration consumerDecl,
+                                                  Set<String> changedOwnershipPackages) {
+        if (changedOwnershipPackages.isEmpty()) {
+            return false;
+        }
+        for (ServiceConsumption consumption : consumerDecl.consumes()) {
+            String pkg = packageOf(consumption.serviceInterface());
+            if (pkg != null && changedOwnershipPackages.contains(pkg)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static ServiceBinding bindOne(String consumer,
                                           ServiceConsumption consumption,
                                           Map<String, ModuleDeclaration> declarations,
                                           DependencyGraph graph,
-                                          Map<String, PackageOwnership> packageOwners) {
+                                          Map<String, PackageOwnership> packageOwners,
+                                          Map<String, List<String>> readable) {
         String serviceInterface = consumption.serviceInterface();
         List<Candidate> candidates = new ArrayList<>();
 
         Set<String> direct = new TreeSet<>(graph.directDependencies(consumer));
-        Set<String> visible = new TreeSet<>(direct);
-        visible.addAll(graph.transitiveDependencies(consumer));
+        Set<String> visible = new TreeSet<>(readable.getOrDefault(consumer, List.of()));
 
         for (ModuleDeclaration providerDecl : declarations.values()) {
             String provider = providerDecl.name();

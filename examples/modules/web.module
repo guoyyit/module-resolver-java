@@ -1,0 +1,6 @@
+# 前端模块：只直接依赖应用模块；由于应用模块以 transitive 依赖核心模块，
+# 核心模块导出的 com.example.api 包对本模块可读，因此可以绑定核心模块提供的服务。
+# 若 app.module 去掉 transitive 修饰，本模块将不再读到核心模块，绑定会变为缺失。
+module com.example.web
+requires com.example.app
+consumes com.example.api.Greeter

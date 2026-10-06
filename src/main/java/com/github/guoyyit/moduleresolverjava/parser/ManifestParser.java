@@ -24,7 +24,7 @@ import java.util.regex.Pattern;
  * <p>Declaration grammar (line oriented, UTF-8, {@code #} starts a comment):
  * <pre>
  * module   &lt;module-name&gt;
- * requires [static] &lt;module-name&gt;
+ * requires [static] [transitive] &lt;module-name&gt;
  * exports  &lt;package-name&gt;
  * provides &lt;interface&gt; with &lt;impl&gt;[, &lt;impl&gt; ...]
  * consumes [optional] &lt;interface&gt;
@@ -107,27 +107,59 @@ public final class ManifestParser {
                 }
                 case "requires" -> {
                     boolean optional = false;
-                    int nameIndex = 1;
-                    if (tokens.size() >= 2 && "static".equals(tokens.get(1))) {
-                        optional = true;
-                        nameIndex = 2;
+                    boolean transitive = false;
+                    int index = 1;
+                    boolean modifierError = false;
+                    while (index < tokens.size() && isRequiresModifier(tokens.get(index))) {
+                        String modifier = tokens.get(index);
+                        Position modifierPos =
+                                tokenPosition(safeFile, lineNo, column, trimmed, index);
+                        if ("static".equals(modifier)) {
+                            if (optional) {
+                                error(diagnostics, modifierPos, "DUPLICATE_MODIFIER",
+                                        "modifier 'static' repeated in 'requires'");
+                                modifierError = true;
+                            }
+                            optional = true;
+                        } else {
+                            if (transitive) {
+                                error(diagnostics, modifierPos, "DUPLICATE_MODIFIER",
+                                        "modifier 'transitive' repeated in 'requires'");
+                                modifierError = true;
+                            }
+                            transitive = true;
+                        }
+                        index++;
                     }
-                    if (tokens.size() != nameIndex + 1) {
-                        error(diagnostics, keywordPos, "MALFORMED_DIRECTIVE",
-                                "'requires' expects 'requires [static] <module-name>'");
+                    if (modifierError) {
                         break;
                     }
-                    String name = tokens.get(nameIndex);
+                    int remaining = tokens.size() - index;
+                    if (remaining == 0) {
+                        error(diagnostics, keywordPos, "MALFORMED_DIRECTIVE",
+                                "'requires' expects a module name after its modifiers");
+                        break;
+                    }
+                    if (remaining > 1) {
+                        error(diagnostics,
+                                tokenPosition(safeFile, lineNo, column, trimmed, index),
+                                "UNKNOWN_MODIFIER",
+                                "unknown modifier '" + tokens.get(index)
+                                        + "'; 'requires' expects 'requires [static] [transitive]"
+                                        + " <module-name>'");
+                        break;
+                    }
+                    String name = tokens.get(index);
                     Position namePos =
-                            tokenPosition(safeFile, lineNo, column, trimmed, nameIndex);
+                            tokenPosition(safeFile, lineNo, column, trimmed, index);
                     if (!isQualifiedName(name)) {
                         error(diagnostics, namePos, "INVALID_NAME",
                                 "invalid required module name '" + name + "'");
                         break;
                     }
                     if (seenRequires.add(name)) {
-                        requires.add(new ModuleDependency(name, optional,
-                                tokenPosition(safeFile, lineNo, column, trimmed, nameIndex)));
+                        requires.add(new ModuleDependency(name, optional, transitive,
+                                tokenPosition(safeFile, lineNo, column, trimmed, index)));
                     } else {
                         warning(diagnostics, namePos, "DUPLICATE_REQUIRES",
                                 "duplicate requires '" + name + "' ignored");
@@ -281,7 +313,9 @@ public final class ManifestParser {
                 index++;
             }
         }
-        return new Position(file, lineNo, indent + offset + 1);
+        // indent is the 1-based column of the first token; a token at
+        // 0-based trimmed offset starts at column indent + offset.
+        return new Position(file, lineNo, indent + offset);
     }
 
     /**
@@ -306,6 +340,10 @@ public final class ManifestParser {
             seen++;
         }
         return "";
+    }
+
+    private static boolean isRequiresModifier(String token) {
+        return "static".equals(token) || "transitive".equals(token);
     }
 
     private static boolean isQualifiedName(String value) {

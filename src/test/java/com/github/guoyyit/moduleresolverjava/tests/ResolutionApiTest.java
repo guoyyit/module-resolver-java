@@ -61,4 +61,36 @@ class ResolutionApiTest {
                 .andExpect(jsonPath(
                         "$.files['zbad.module'].diagnostics[0].position.line").value(1));
     }
+
+    @Test
+    void transitiveVisibilityIsExposedThroughApi() throws Exception {
+        mockMvc.perform(post("/api/resolution/files")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"file\":\"tcore.module\",\"content\":\"module com.tcore\\nexports pkg.tcore\\n\"}"))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/resolution/files")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"file\":\"tmid.module\",\"content\":\"module com.tmid\\nrequires transitive com.tcore\\n\"}"))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/resolution/files")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"file\":\"tapp.module\",\"content\":\"module com.tapp\\nrequires com.tmid\\n\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.modules['com.tapp'].readableModules[0]")
+                        .value("com.tcore"))
+                .andExpect(jsonPath("$.modules['com.tapp'].readableModules[1]")
+                        .value("com.tmid"))
+                .andExpect(jsonPath("$.modules['com.tmid'].propagatedModules[0]")
+                        .value("com.tcore"));
+
+        // Removing the modifier hides the indirect package again.
+        mockMvc.perform(post("/api/resolution/files")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"file\":\"tmid.module\",\"content\":\"module com.tmid\\nrequires com.tcore\\n\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.modules['com.tapp'].readableModules[0]")
+                        .value("com.tmid"))
+                .andExpect(jsonPath("$.modules['com.tapp'].readableModules.length()")
+                        .value(1));
+    }
 }

@@ -209,4 +209,73 @@ class ConcurrencyConsistencyTest {
         assertTrue(rejected > 0, "overload should have triggered bounded queue rejection");
         service.stop();
     }
+
+    @Test
+    void readersSeeConsistentVisibilityDuringConcurrentUpdates(@TempDir Path stateDir)
+            throws Exception {
+        ResolutionService service = newService(stateDir);
+        service.upsertFile("core.module", "module com.core\nexports pkg.core\n");
+        service.upsertFile("mid.module", "module com.mid\nrequires transitive com.core\n");
+        service.upsertFile("app.module", "module com.app\nrequires com.mid\n");
+
+        AtomicReference<Throwable> readerFailure = new AtomicReference<>();
+        CountDownLatch stop = new CountDownLatch(1);
+        Runnable reader = () -> {
+            while (stop.getCount() > 0) {
+                try {
+                    ResolutionSnapshot snapshot = service.current();
+                    var app = snapshot.modules().get("com.app");
+                    var mid = snapshot.modules().get("com.mid");
+                    if (app != null && mid != null) {
+                        // Within one committed version, com.app reads com.core
+                        // exactly when com.mid propagates it; a torn read
+                        // means the snapshot exposed a half-updated state.
+                        boolean midPropagates =
+                                mid.propagatedModules().contains("com.core");
+                        boolean appReadsCore =
+                                app.readableModules().contains("com.core");
+                        if (midPropagates != appReadsCore) {
+                            readerFailure.set(new AssertionError(
+                                    "torn visibility at version " + snapshot.version()
+                                            + ": mid propagates=" + midPropagates
+                                            + " but app reads core=" + appReadsCore));
+                            return;
+                        }
+                        if (!app.readableModules().contains("com.mid")) {
+                            readerFailure.set(new AssertionError(
+                                    "com.app lost its direct dependency at version "
+                                            + snapshot.version()));
+                            return;
+                        }
+                    }
+                } catch (Throwable t) {
+                    readerFailure.set(t);
+                    return;
+                }
+            }
+        };
+        List<Thread> readers = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            Thread thread = new Thread(reader, "visibility-reader-" + i);
+            thread.setDaemon(true);
+            thread.start();
+            readers.add(thread);
+        }
+
+        // Interleave incremental updates that flip the propagation edge.
+        for (int i = 0; i < 100; i++) {
+            String modifier = i % 2 == 0 ? "requires com.core" : "requires transitive com.core";
+            service.upsertFile("mid.module", "module com.mid\n" + modifier + "\n");
+        }
+        stop.countDown();
+        for (Thread thread : readers) {
+            thread.join(5000);
+        }
+
+        assertEquals(null, readerFailure.get());
+        // The last write (i = 99) restored the transitive edge.
+        assertTrue(service.current().modules().get("com.app").readableModules()
+                .contains("com.core"));
+        service.stop();
+    }
 }

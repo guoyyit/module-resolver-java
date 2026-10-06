@@ -103,4 +103,79 @@ class ManifestParserTest {
         assertEquals("com.example.ImplTwo",
                 outcome.declaration().provides().get(1).implementation());
     }
+
+    @Test
+    void parsesTransitiveAndStaticTransitiveRequires() {
+        String content = """
+                module com.example.app
+                requires transitive com.example.core
+                requires static transitive com.example.logging
+                requires transitive static com.example.metrics
+                requires com.example.plain
+                """;
+
+        FileParseOutcome outcome = parser.parse("t.module", content);
+
+        assertTrue(outcome.success(), () -> outcome.diagnostics().toString());
+        var requires = outcome.declaration().requires();
+        assertEquals(4, requires.size());
+        assertFalse(requires.get(0).optional());
+        assertTrue(requires.get(0).transitive());
+        assertEquals("com.example.core", requires.get(0).name());
+        assertTrue(requires.get(1).optional());
+        assertTrue(requires.get(1).transitive());
+        assertTrue(requires.get(2).optional());
+        assertTrue(requires.get(2).transitive());
+        assertFalse(requires.get(3).optional());
+        assertFalse(requires.get(3).transitive());
+    }
+
+    @Test
+    void unknownRequiresModifierIsAPositionedDistinctError() {
+        FileParseOutcome outcome = parser.parse("u.module",
+                "module com.example.app\nrequires bogus com.example.core\n");
+
+        assertFalse(outcome.success());
+        Diagnostic error = outcome.diagnostics().get(0);
+        assertEquals("UNKNOWN_MODIFIER", error.code());
+        assertEquals(Diagnostic.Severity.ERROR, error.severity());
+        assertEquals(2, error.position().line());
+        assertEquals(10, error.position().column());
+        assertEquals("u.module", error.position().file());
+    }
+
+    @Test
+    void repeatedRequiresModifierIsAPositionedDistinctError() {
+        FileParseOutcome outcome = parser.parse("v.module",
+                "module com.example.app\nrequires transitive transitive com.example.core\n");
+
+        assertFalse(outcome.success());
+        Diagnostic error = outcome.diagnostics().get(0);
+        assertEquals("DUPLICATE_MODIFIER", error.code());
+        assertEquals(2, error.position().line());
+        assertEquals(21, error.position().column());
+    }
+
+    @Test
+    void requiresWithModifierButNoNameIsMalformed() {
+        FileParseOutcome outcome = parser.parse("w.module",
+                "module com.example.app\nrequires transitive\n");
+
+        assertFalse(outcome.success());
+        assertTrue(outcome.diagnostics().stream()
+                .anyMatch(d -> "MALFORMED_DIRECTIVE".equals(d.code())
+                        && d.position().line() == 2));
+    }
+
+    @Test
+    void brokenTransitiveSyntaxDoesNotBlockOtherFiles() {
+        FileParseOutcome broken = parser.parse("broken.module",
+                "module com.broken\nrequires transitive transitive com.x\n");
+        FileParseOutcome healthy = parser.parse("healthy.module",
+                "module com.healthy\nrequires transitive com.broken\n");
+
+        assertFalse(broken.success());
+        assertTrue(healthy.success());
+        assertTrue(healthy.declaration().requires().get(0).transitive());
+    }
 }
