@@ -209,4 +209,91 @@ class ConcurrencyConsistencyTest {
         assertTrue(rejected > 0, "overload should have triggered bounded queue rejection");
         service.stop();
     }
+
+    /**
+     * While a writer keeps toggling the {@code transitive} modifier (which
+     * changes downstream readability), concurrent readers must always observe
+     * one complete, internally consistent snapshot: every module's readable
+     * set sits between its direct dependencies and its full reachability,
+     * and readability conclusions never appear half-updated.
+     */
+    @Test
+    void queriesDuringVisibilityUpdatesReadConsistentSnapshots(@TempDir Path stateDir)
+            throws Exception {
+        ResolutionService service = newService(stateDir);
+        service.upsertFile("app.module",
+                "module com.app\nrequires com.biz\nconsumes api.Greeter\n");
+        service.upsertFile("core.module",
+                "module com.core\nexports api\nprovides api.Greeter with impl.GreeterImpl\n");
+
+        AtomicReference<Throwable> readerFailure = new AtomicReference<>();
+        CountDownLatch stop = new CountDownLatch(1);
+        Runnable reader = () -> {
+            while (stop.getCount() > 0) {
+                try {
+                    ResolutionSnapshot snapshot = service.current();
+                    if (snapshot.modules().size() != snapshot.declarations().size()) {
+                        throw new AssertionError("torn snapshot: modules vs declarations");
+                    }
+                    for (var resolution : snapshot.modules().values()) {
+                        Set<String> direct = new HashSet<>(resolution.directDependencies());
+                        Set<String> reachable = new HashSet<>(direct);
+                        reachable.addAll(resolution.transitiveDependencies());
+                        Set<String> readable = new HashSet<>(resolution.readableModules());
+                        if (!readable.containsAll(direct)) {
+                            throw new AssertionError("readable set misses direct "
+                                    + "dependencies of " + resolution.moduleName());
+                        }
+                        if (!reachable.containsAll(readable)) {
+                            throw new AssertionError("readable set escapes reachability of "
+                                    + resolution.moduleName());
+                        }
+                    }
+                    var binding = snapshot.serviceBindings().get("com.app");
+                    var app = snapshot.modules().get("com.app");
+                    if (binding != null && app != null) {
+                        boolean coreReadable =
+                                app.readableModules().contains("com.core");
+                        boolean bound = binding.stream()
+                                .anyMatch(b -> "BOUND".equals(b.status())
+                                        && "com.core".equals(b.selectedProvider()));
+                        if (coreReadable != bound) {
+                            throw new AssertionError("binding/visibility mismatch: readable="
+                                    + coreReadable + " bound=" + bound);
+                        }
+                    }
+                } catch (Throwable t) {
+                    readerFailure.compareAndSet(null, t);
+                    return;
+                }
+            }
+        };
+        List<Thread> readers = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            Thread thread = new Thread(reader);
+            thread.setDaemon(true);
+            thread.start();
+            readers.add(thread);
+        }
+
+        for (int i = 0; i < 60; i++) {
+            boolean transitive = i % 2 == 0;
+            service.upsertFile("biz.module",
+                    "module com.biz\nrequires "
+                            + (transitive ? "transitive " : "") + "com.core\n");
+        }
+        stop.countDown();
+        for (Thread reader2 : readers) {
+            reader2.join(5000);
+        }
+
+        assertEquals(null, readerFailure.get());
+        // Final state: last write used plain requires, so com.core is not
+        // readable and the service is unbound.
+        var app = service.current().modules().get("com.app");
+        assertEquals(List.of("com.biz"), app.readableModules());
+        assertEquals("MISSING_REQUIRED",
+                service.current().serviceBindings().get("com.app").get(0).status());
+        service.stop();
+    }
 }

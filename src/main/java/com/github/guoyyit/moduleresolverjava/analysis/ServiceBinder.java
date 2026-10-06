@@ -20,15 +20,18 @@ import java.util.TreeSet;
  * Validates {@code consumes} declarations against visible {@code provides}.
  *
  * <p>Visibility rule: a consumer M may use an interface provided by module P
- * when M == P or M depends on P (directly or transitively). Candidate
- * providers are further required to export the interface's package (the
- * package owner must export it to M through the chain; package ownership
- * itself is validated by {@link PackageConflictResolver}).
+ * when M == P or P is <em>readable</em> to M — i.e. M requires P directly, or
+ * P is propagated to M through {@code requires transitive} edges (see
+ * {@link VisibilityIndex}). A provider reachable only through plain
+ * non-propagating requires edges is <em>not</em> visible and never
+ * participates in binding. Candidate providers are further required to export
+ * the interface's package (package ownership itself is validated by
+ * {@link PackageConflictResolver}).
  *
  * <p>Selection rule for multiple visible providers:
  * <ol>
  *   <li>{@code DIRECT_PROVIDER}: providers required directly take precedence
- *       over transitively required ones.</li>
+ *       over providers visible only through propagation.</li>
  *   <li>{@code LEXICOGRAPHIC}: the lexicographically smallest
  *       {@code (provider-module, implementation-class)} pair wins.</li>
  * </ol>
@@ -42,16 +45,32 @@ import java.util.TreeSet;
  */
 public final class ServiceBinder {
 
+    /**
+     * Backwards-compatible entry point: computes a full visibility index from
+     * the declarations. The engine prefers the overload taking a
+     * pre-computed, incrementally maintained {@link VisibilityIndex}.
+     */
     public Map<String, List<ServiceBinding>> bind(Map<String, ModuleDeclaration> declarations,
                                                   DependencyGraph graph,
                                                   Map<String, PackageOwnership> packageOwners) {
+        return bind(declarations, graph, packageOwners,
+                VisibilityIndex.compute(declarations));
+    }
+
+    public Map<String, List<ServiceBinding>> bind(Map<String, ModuleDeclaration> declarations,
+                                                  DependencyGraph graph,
+                                                  Map<String, PackageOwnership> packageOwners,
+                                                  VisibilityIndex visibilityIndex) {
         Map<String, List<ServiceBinding>> result = new TreeMap<>();
+        Map<String, List<ProviderEntry>> providersByInterface =
+                providersByInterface(declarations);
 
         for (ModuleDeclaration consumerDecl : new TreeMap<>(declarations).values()) {
             String consumer = consumerDecl.name();
             List<ServiceBinding> bindings = new ArrayList<>();
             for (ServiceConsumption consumption : consumerDecl.consumes()) {
-                bindings.add(bindOne(consumer, consumption, declarations, graph, packageOwners));
+                bindings.add(bindOne(consumer, consumption, declarations, graph,
+                        packageOwners, visibilityIndex, providersByInterface));
             }
             if (!bindings.isEmpty()) {
                 result.put(consumer, List.copyOf(bindings));
@@ -60,35 +79,55 @@ public final class ServiceBinder {
         return Map.copyOf(result);
     }
 
-    private static ServiceBinding bindOne(String consumer,
-                                          ServiceConsumption consumption,
-                                          Map<String, ModuleDeclaration> declarations,
-                                          DependencyGraph graph,
-                                          Map<String, PackageOwnership> packageOwners) {
+    /**
+     * Index of service interface -&gt; providing (module, implementation)
+     * pairs, built once so binding cost stays proportional to the number of
+     * consumptions and matching providers.
+     */
+    private static Map<String, List<ProviderEntry>> providersByInterface(
+            Map<String, ModuleDeclaration> declarations) {
+        Map<String, List<ProviderEntry>> index = new TreeMap<>();
+        for (ModuleDeclaration declaration : new TreeMap<>(declarations).values()) {
+            for (ProvidedService provided : declaration.provides()) {
+                index.computeIfAbsent(provided.serviceInterface(),
+                                key -> new ArrayList<>())
+                        .add(new ProviderEntry(declaration.name(), provided));
+            }
+        }
+        return index;
+    }
+
+    private static ServiceBinding bindOne(
+            String consumer,
+            ServiceConsumption consumption,
+            Map<String, ModuleDeclaration> declarations,
+            DependencyGraph graph,
+            Map<String, PackageOwnership> packageOwners,
+            VisibilityIndex visibilityIndex,
+            Map<String, List<ProviderEntry>> providersByInterface) {
         String serviceInterface = consumption.serviceInterface();
         List<Candidate> candidates = new ArrayList<>();
 
         Set<String> direct = new TreeSet<>(graph.directDependencies(consumer));
-        Set<String> visible = new TreeSet<>(direct);
-        visible.addAll(graph.transitiveDependencies(consumer));
+        List<String> readable =
+                visibilityIndex.visibilityOf(consumer).readableModules();
 
-        for (ModuleDeclaration providerDecl : declarations.values()) {
-            String provider = providerDecl.name();
+        for (ProviderEntry entry : providersByInterface
+                .getOrDefault(serviceInterface, List.of())) {
+            String provider = entry.provider();
             boolean sameModule = provider.equals(consumer);
-            if (!sameModule && !visible.contains(provider)) {
+            if (!sameModule
+                    && java.util.Collections.binarySearch(readable, provider) < 0) {
                 continue;
             }
-            for (ProvidedService provided : providerDecl.provides()) {
-                if (!provided.serviceInterface().equals(serviceInterface)) {
-                    continue;
-                }
-                if (!packageExportedToConsumer(providerDecl, serviceInterface,
-                        consumer, sameModule, declarations, packageOwners)) {
-                    continue;
-                }
-                candidates.add(new Candidate(provider, provided.implementation(),
-                        sameModule || direct.contains(provider), provided.position()));
+            ModuleDeclaration providerDecl = declarations.get(provider);
+            ProvidedService provided = entry.provided();
+            if (!packageExportedToConsumer(providerDecl, serviceInterface,
+                    consumer, sameModule, declarations, packageOwners)) {
+                continue;
             }
+            candidates.add(new Candidate(provider, provided.implementation(),
+                    sameModule || direct.contains(provider), provided.position()));
         }
 
         List<String> candidateKeys = new ArrayList<>();
@@ -176,6 +215,9 @@ public final class ServiceBinder {
     private static String packageOf(String className) {
         int dot = className.lastIndexOf('.');
         return dot < 0 ? null : className.substring(0, dot);
+    }
+
+    private record ProviderEntry(String provider, ProvidedService provided) {
     }
 
     private record Candidate(String provider, String implementation,

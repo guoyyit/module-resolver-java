@@ -24,7 +24,7 @@ import java.util.regex.Pattern;
  * <p>Declaration grammar (line oriented, UTF-8, {@code #} starts a comment):
  * <pre>
  * module   &lt;module-name&gt;
- * requires [static] &lt;module-name&gt;
+ * requires [static] [transitive] &lt;module-name&gt;
  * exports  &lt;package-name&gt;
  * provides &lt;interface&gt; with &lt;impl&gt;[, &lt;impl&gt; ...]
  * consumes [optional] &lt;interface&gt;
@@ -107,14 +107,23 @@ public final class ManifestParser {
                 }
                 case "requires" -> {
                     boolean optional = false;
+                    boolean transitive = false;
                     int nameIndex = 1;
-                    if (tokens.size() >= 2 && "static".equals(tokens.get(1))) {
-                        optional = true;
-                        nameIndex = 2;
+                    while (nameIndex < tokens.size()) {
+                        String modifier = tokens.get(nameIndex);
+                        if ("static".equals(modifier) && !optional) {
+                            optional = true;
+                            nameIndex++;
+                        } else if ("transitive".equals(modifier) && !transitive) {
+                            transitive = true;
+                            nameIndex++;
+                        } else {
+                            break;
+                        }
                     }
                     if (tokens.size() != nameIndex + 1) {
                         error(diagnostics, keywordPos, "MALFORMED_DIRECTIVE",
-                                "'requires' expects 'requires [static] <module-name>'");
+                                "'requires' expects 'requires [static] [transitive] <module-name>'");
                         break;
                     }
                     String name = tokens.get(nameIndex);
@@ -126,7 +135,7 @@ public final class ManifestParser {
                         break;
                     }
                     if (seenRequires.add(name)) {
-                        requires.add(new ModuleDependency(name, optional,
+                        requires.add(new ModuleDependency(name, optional, transitive,
                                 tokenPosition(safeFile, lineNo, column, trimmed, nameIndex)));
                     } else {
                         warning(diagnostics, namePos, "DUPLICATE_REQUIRES",

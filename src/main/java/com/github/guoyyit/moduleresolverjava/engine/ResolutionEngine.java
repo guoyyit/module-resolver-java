@@ -2,6 +2,7 @@ package com.github.guoyyit.moduleresolverjava.engine;
 
 import com.github.guoyyit.moduleresolverjava.analysis.PackageConflictResolver;
 import com.github.guoyyit.moduleresolverjava.analysis.ServiceBinder;
+import com.github.guoyyit.moduleresolverjava.analysis.VisibilityIndex;
 import com.github.guoyyit.moduleresolverjava.graph.CycleDetector;
 import com.github.guoyyit.moduleresolverjava.graph.DependencyGraph;
 import com.github.guoyyit.moduleresolverjava.model.Diagnostic;
@@ -15,14 +16,17 @@ import com.github.guoyyit.moduleresolverjava.model.ResolutionSnapshot;
 import com.github.guoyyit.moduleresolverjava.model.ServiceBinding;
 
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Pure, deterministic resolution logic with no I/O and no persistence.
@@ -37,6 +41,20 @@ public final class ResolutionEngine {
     private final PackageConflictResolver packageConflictResolver = new PackageConflictResolver();
     private final ServiceBinder serviceBinder = new ServiceBinder();
     private final CycleDetector cycleDetector = new CycleDetector();
+
+    /**
+     * Cache of the visibility index belonging to the most recently produced
+     * snapshot, keyed by the identity of that snapshot's declarations map.
+     * Purely a speed-up: the index content is a pure function of the
+     * declarations, so a miss simply triggers a full (deterministic)
+     * recomputation. Bounded to one entry, so memory does not grow with the
+     * number of commits.
+     */
+    private final AtomicReference<CachedIndex> indexCache = new AtomicReference<>();
+
+    private record CachedIndex(Map<String, ModuleDeclaration> declarations,
+                               VisibilityIndex index) {
+    }
 
     public ResolutionResult fullResolve(Map<String, FileParseOutcome> fileOutcomes,
                                         long baseVersion) {
@@ -83,13 +101,20 @@ public final class ResolutionEngine {
             return new ResolutionResult(null, Set.of(), Map.of(), true);
         }
 
+        Set<String> changedModules = changedModuleNames(previous, changedFiles, files);
+        VisibilityIndex visibilityIndex =
+                visibilityIndex(previous, declarations, changedModules);
+        if (Thread.currentThread().isInterrupted()) {
+            return new ResolutionResult(null, Set.of(), Map.of(), true);
+        }
+
         Map<String, PackageOwnership> packageOwners =
                 packageConflictResolver.resolve(declarations);
         if (Thread.currentThread().isInterrupted()) {
             return new ResolutionResult(null, Set.of(), Map.of(), true);
         }
         Map<String, List<ServiceBinding>> serviceBindings =
-                serviceBinder.bind(declarations, graph, packageOwners);
+                serviceBinder.bind(declarations, graph, packageOwners, visibilityIndex);
         if (Thread.currentThread().isInterrupted()) {
             return new ResolutionResult(null, Set.of(), Map.of(), true);
         }
@@ -97,17 +122,18 @@ public final class ResolutionEngine {
         List<List<String>> cycles = cycleDetector.findCycles(graph);
         Map<String, Set<List<String>>> cyclesByModule = cycleDetector.cyclesByModule(graph);
 
-        Map<String, ModuleResolution> modules = buildModuleResolutions(
-                declarations, graph, cyclesByModule, packageOwners, serviceBindings);
-
-        addPackageDiagnostics(packageOwners, globalDiagnostics);
-        addServiceDiagnostics(serviceBindings, globalDiagnostics);
-        addCycleDiagnostics(cycles, globalDiagnostics);
-
         Set<String> affected = previous == null
                 ? Set.copyOf(declarations.keySet())
                 : computeAffected(previous, changedFiles, files, declarations,
                         packageOwners, serviceBindings);
+
+        Map<String, ModuleResolution> modules = buildModuleResolutions(
+                declarations, graph, cyclesByModule, packageOwners, serviceBindings,
+                visibilityIndex, previous);
+
+        addPackageDiagnostics(packageOwners, globalDiagnostics);
+        addServiceDiagnostics(serviceBindings, globalDiagnostics);
+        addCycleDiagnostics(cycles, globalDiagnostics);
 
         ResolutionSnapshot snapshot = new ResolutionSnapshot(
                 baseVersion + 1, Instant.now(),
@@ -117,6 +143,7 @@ public final class ResolutionEngine {
                 List.copyOf(globalDiagnostics),
                 Map.copyOf(packageOwners),
                 deepCopyBindings(serviceBindings));
+        indexCache.set(new CachedIndex(snapshot.declarations(), visibilityIndex));
         Map<String, FileParseOutcome> reparsed = new TreeMap<>();
         for (String file : changedFiles) {
             FileParseOutcome outcome = files.get(file);
@@ -199,12 +226,29 @@ public final class ResolutionEngine {
         return DependencyGraph.from(edges);
     }
 
+    /**
+     * Builds the per-module conclusions. Visibility lists are taken from the
+     * {@link VisibilityIndex} (shared immutable objects, no copies). When the
+     * freshly computed conclusion is content-equal to the previous version's,
+     * the previous object is reused as-is, so modules whose conclusion did not
+     * truly change keep the exact same conclusion object across versions.
+     */
     private static Map<String, ModuleResolution> buildModuleResolutions(
             Map<String, ModuleDeclaration> declarations,
             DependencyGraph graph,
             Map<String, Set<List<String>>> cyclesByModule,
             Map<String, PackageOwnership> packageOwners,
-            Map<String, List<ServiceBinding>> serviceBindings) {
+            Map<String, List<ServiceBinding>> serviceBindings,
+            VisibilityIndex visibilityIndex,
+            ResolutionSnapshot previous) {
+        Map<String, List<Diagnostic>> ownershipDiagnostics = new TreeMap<>();
+        for (PackageOwnership ownership : packageOwners.values()) {
+            String shadowed = shadowingModule(ownership);
+            if (shadowed != null) {
+                ownershipDiagnostics.computeIfAbsent(shadowed,
+                        key -> new ArrayList<>()).addAll(ownership.diagnostics());
+            }
+        }
         Map<String, ModuleResolution> result = new TreeMap<>();
         for (ModuleDeclaration declaration : declarations.values()) {
             String name = declaration.name();
@@ -213,23 +257,25 @@ public final class ResolutionEngine {
             sortedCycles.sort((a, b) -> a.toString().compareTo(b.toString()));
 
             List<Diagnostic> diagnostics = new ArrayList<>();
-            for (PackageOwnership ownership : packageOwners.values()) {
-                if (name.equals(shadowingModule(ownership))) {
-                    diagnostics.addAll(ownership.diagnostics());
-                }
-            }
+            diagnostics.addAll(ownershipDiagnostics.getOrDefault(name, List.of()));
             for (ServiceBinding binding : serviceBindings.getOrDefault(name, List.of())) {
                 diagnostics.addAll(binding.diagnostics());
             }
 
-            result.put(name, new ModuleResolution(
+            VisibilityIndex.ModuleVisibility visibility = visibilityIndex.visibilityOf(name);
+            ModuleResolution candidate = new ModuleResolution(
                     name,
                     declaration.file(),
                     List.copyOf(graph.directDependencies(name)),
-                    List.copyOf(graph.transitiveDependencies(name)),
+                    visibility.transitiveDependencies(),
+                    visibility.readableModules(),
                     !cycles.isEmpty(),
                     List.copyOf(sortedCycles),
-                    List.copyOf(diagnostics)));
+                    List.copyOf(diagnostics));
+            ModuleResolution previousResolution =
+                    previous == null ? null : previous.modules().get(name);
+            result.put(name, candidate.equals(previousResolution)
+                    ? previousResolution : candidate);
         }
         return result;
     }
@@ -273,6 +319,19 @@ public final class ResolutionEngine {
         }
     }
 
+    /**
+     * Modules whose conclusions may change as a result of the changed files:
+     * <ol>
+     *   <li>the modules declared by the changed files (old and new names);</li>
+     *   <li>their reverse dependency cone — everything that can reach them
+     *       through requires edges in the old or the new graph, which covers
+     *       readability changes caused by {@code requires transitive}
+     *       modifier edits;</li>
+     *   <li>all contenders of any package whose ownership verdict changed
+     *       (covers conflicts that appeared or disappeared);</li>
+     *   <li>all consumers whose service bindings changed.</li>
+     * </ol>
+     */
     private static Set<String> computeAffected(
             ResolutionSnapshot previous,
             Set<String> changedFiles,
@@ -285,55 +344,91 @@ public final class ResolutionEngine {
             addModuleOfFile(previous.files().get(file), affected);
             addModuleOfFile(currentFiles.get(file), affected);
         }
-        Set<String> initial = Set.copyOf(affected);
-        for (String module : currentDeclarations.keySet()) {
-            for (String seed : initial) {
-                if (dependsOn(currentDeclarations, module, seed)) {
-                    affected.add(module);
+        Map<String, Set<String>> reverse = new TreeMap<>();
+        addReverseEdges(previous.declarations(), reverse);
+        addReverseEdges(currentDeclarations, reverse);
+        Deque<String> queue = new ArrayDeque<>(affected);
+        while (!queue.isEmpty()) {
+            String current = queue.poll();
+            for (String source : reverse.getOrDefault(current, Set.of())) {
+                if (affected.add(source)) {
+                    queue.add(source);
                 }
             }
         }
-        for (PackageOwnership ownership : currentOwners.values()) {
-            if (ownership.conflict()) {
-                affected.addAll(ownership.contenders());
+        Set<String> packages = new TreeSet<>(previous.packageOwners().keySet());
+        packages.addAll(currentOwners.keySet());
+        for (String packageName : packages) {
+            PackageOwnership before = previous.packageOwners().get(packageName);
+            PackageOwnership after = currentOwners.get(packageName);
+            if (!Objects.equals(before, after)) {
+                if (before != null) {
+                    affected.addAll(before.contenders());
+                }
+                if (after != null) {
+                    affected.addAll(after.contenders());
+                }
             }
         }
-        for (Map.Entry<String, List<ServiceBinding>> entry : currentBindings.entrySet()) {
-            for (ServiceBinding binding : entry.getValue()) {
-                if (!"BOUND".equals(binding.status())
-                        || initial.contains(binding.selectedProvider())) {
-                    affected.add(entry.getKey());
-                }
+        Set<String> consumers = new TreeSet<>(previous.serviceBindings().keySet());
+        consumers.addAll(currentBindings.keySet());
+        for (String consumer : consumers) {
+            if (!Objects.equals(previous.serviceBindings().get(consumer),
+                    currentBindings.get(consumer))) {
+                affected.add(consumer);
             }
         }
         return Set.copyOf(affected);
+    }
+
+    private static void addReverseEdges(Map<String, ModuleDeclaration> declarations,
+                                        Map<String, Set<String>> reverse) {
+        for (ModuleDeclaration declaration : declarations.values()) {
+            for (ModuleDependency dependency : declaration.requires()) {
+                reverse.computeIfAbsent(dependency.name(),
+                        key -> new TreeSet<>()).add(declaration.name());
+            }
+        }
+    }
+
+    /**
+     * Old and new module names declared by the changed files.
+     */
+    private static Set<String> changedModuleNames(ResolutionSnapshot previous,
+                                                  Set<String> changedFiles,
+                                                  Map<String, FileParseOutcome> currentFiles) {
+        Set<String> names = new TreeSet<>();
+        if (previous != null) {
+            for (String file : changedFiles) {
+                addModuleOfFile(previous.files().get(file), names);
+                addModuleOfFile(currentFiles.get(file), names);
+            }
+        }
+        return names;
+    }
+
+    /**
+     * Returns the visibility index for the current declarations, advancing the
+     * cached previous index incrementally when it is available.
+     */
+    private VisibilityIndex visibilityIndex(ResolutionSnapshot previous,
+                                            Map<String, ModuleDeclaration> declarations,
+                                            Set<String> changedModules) {
+        if (previous == null) {
+            return VisibilityIndex.compute(declarations);
+        }
+        CachedIndex cached = indexCache.get();
+        if (cached != null && cached.declarations() == previous.declarations()) {
+            return cached.index().update(
+                    previous.declarations(), declarations, changedModules);
+        }
+        return VisibilityIndex.compute(declarations);
     }
 
     private static void addModuleOfFile(FileParseOutcome outcome, Set<String> target) {
         if (outcome != null && outcome.success()) {
             target.add(outcome.declaration().name());
         }
-    }
-
-    private static boolean dependsOn(Map<String, ModuleDeclaration> declarations,
-                                     String module, String dependency) {
-        if (module.equals(dependency)) {
-            return true;
-        }
-        Set<String> seen = new HashSet<>();
-        List<String> queue = new ArrayList<>(declarations.get(module).requires().stream()
-                .map(ModuleDependency::name).toList());
-        while (!queue.isEmpty()) {
-            String current = queue.remove(0);
-            if (current.equals(dependency)) {
-                return true;
-            }
-            if (seen.add(current) && declarations.containsKey(current)) {
-                queue.addAll(declarations.get(current).requires().stream()
-                        .map(ModuleDependency::name).toList());
-            }
-        }
-        return false;
     }
 
     private static Map<String, List<ServiceBinding>> deepCopyBindings(

@@ -1,0 +1,3 @@
+# 框架模块：把核心模块的导出包继续向上游传播（requires transitive）
+module com.example.framework
+requires transitive com.example.core

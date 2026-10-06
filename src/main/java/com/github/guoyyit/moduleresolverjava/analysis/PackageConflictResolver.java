@@ -45,11 +45,22 @@ public final class PackageConflictResolver {
             }
         }
 
-        Map<String, Set<String>> reachable = computeReachability(declarations);
+        Map<String, Set<String>> direct = new TreeMap<>();
+        for (ModuleDeclaration declaration : declarations.values()) {
+            direct.put(declaration.name(), new TreeSet<>(
+                    declaration.requires().stream().map(req -> req.name()).toList()));
+        }
         Map<String, PackageOwnership> result = new TreeMap<>();
+        Map<String, Set<String>> reachable = new HashMap<>();
         for (Map.Entry<String, List<String>> entry : exporters.entrySet()) {
             String packageName = entry.getKey();
             List<String> contenders = new ArrayList<>(new TreeSet<>(entry.getValue()));
+            // Reachability is computed lazily and only for modules that
+            // actually contend for a package, so conflict-free sets do not
+            // pay for a full transitive-closure pass.
+            for (String contender : contenders) {
+                reachable.computeIfAbsent(contender, key -> reach(key, direct));
+            }
             result.put(packageName, resolveOne(packageName, contenders, reachable, exportPositions));
         }
         return Map.copyOf(result);
@@ -103,20 +114,6 @@ public final class PackageConflictResolver {
                 position);
         return new PackageOwnership(packageName, tentativeOwner, List.copyOf(contenders),
                 true, "AMBIGUOUS_EXPORT", List.of(error));
-    }
-
-    private static Map<String, Set<String>> computeReachability(
-            Map<String, ModuleDeclaration> declarations) {
-        Map<String, Set<String>> direct = new TreeMap<>();
-        for (ModuleDeclaration declaration : declarations.values()) {
-            direct.put(declaration.name(), new TreeSet<>(
-                    declaration.requires().stream().map(req -> req.name()).toList()));
-        }
-        Map<String, Set<String>> reachable = new TreeMap<>();
-        for (String module : new TreeSet<>(direct.keySet())) {
-            reachable.put(module, reach(module, direct));
-        }
-        return reachable;
     }
 
     private static Set<String> reach(String start, Map<String, Set<String>> direct) {

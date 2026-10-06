@@ -103,4 +103,65 @@ class ManifestParserTest {
         assertEquals("com.example.ImplTwo",
                 outcome.declaration().provides().get(1).implementation());
     }
+
+    @Test
+    void parsesTransitiveRequiresModifier() {
+        String content = """
+                module com.example.app
+                requires transitive com.example.core
+                requires static transitive com.example.logging
+                requires transitive static com.example.metrics
+                requires com.example.plain
+                """;
+
+        FileParseOutcome outcome = parser.parse("t.module", content);
+
+        assertTrue(outcome.success(), () -> outcome.diagnostics().toString());
+        assertEquals(4, outcome.declaration().requires().size());
+        assertTrue(outcome.declaration().requires().get(0).transitive());
+        assertFalse(outcome.declaration().requires().get(0).optional());
+        assertTrue(outcome.declaration().requires().get(1).transitive());
+        assertTrue(outcome.declaration().requires().get(1).optional());
+        assertTrue(outcome.declaration().requires().get(2).transitive());
+        assertTrue(outcome.declaration().requires().get(2).optional());
+        assertFalse(outcome.declaration().requires().get(3).transitive());
+        assertEquals("com.example.plain", outcome.declaration().requires().get(3).name());
+    }
+
+    @Test
+    void malformedTransitiveRequiresReportsPositionAndKeepsFileLevelIsolation() {
+        FileParseOutcome missingName =
+                parser.parse("bad1.module", "module com.a\nrequires transitive\n");
+        assertFalse(missingName.success());
+        Diagnostic malformed = missingName.diagnostics().stream()
+                .filter(d -> "MALFORMED_DIRECTIVE".equals(d.code())).findFirst().orElseThrow();
+        assertEquals(2, malformed.position().line());
+        assertEquals("bad1.module", malformed.position().file());
+
+        FileParseOutcome danglingModifier =
+                parser.parse("bad2.module", "module com.a\nrequires com.core transitive\n");
+        assertFalse(danglingModifier.success());
+        assertTrue(danglingModifier.diagnostics().stream()
+                .anyMatch(d -> "MALFORMED_DIRECTIVE".equals(d.code())));
+
+        FileParseOutcome duplicatedModifier =
+                parser.parse("bad3.module", "module com.a\nrequires transitive transitive com.core\n");
+        assertFalse(duplicatedModifier.success());
+        assertTrue(duplicatedModifier.diagnostics().stream()
+                .anyMatch(d -> "MALFORMED_DIRECTIVE".equals(d.code())));
+
+        FileParseOutcome invalidName =
+                parser.parse("bad4.module", "module com.a\nrequires transitive 9bad\n");
+        assertFalse(invalidName.success());
+        Diagnostic invalid = invalidName.diagnostics().stream()
+                .filter(d -> "INVALID_NAME".equals(d.code())).findFirst().orElseThrow();
+        assertEquals(2, invalid.position().line());
+        assertTrue(invalid.position().column() > 1);
+
+        // A broken file must not affect parsing of a sibling file.
+        FileParseOutcome healthy =
+                parser.parse("good.module", "module com.b\nrequires transitive com.core\n");
+        assertTrue(healthy.success());
+        assertTrue(healthy.declaration().requires().get(0).transitive());
+    }
 }

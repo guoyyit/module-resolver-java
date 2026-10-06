@@ -1,0 +1,4 @@
+# Web 层模块：不直接依赖 core，但通过 framework 的传播语义读到 core 导出的包
+module com.example.web
+requires com.example.framework
+consumes com.example.api.Greeter
